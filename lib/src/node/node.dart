@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart';
@@ -22,6 +24,8 @@ class S5NodeBase {
   late final StreamMessageService stream;
   late final P2PService p2p;
 
+  final String persistFilePath;
+
   final httpClient = Client();
 
   bool get exposeStore => false;
@@ -31,6 +35,7 @@ class S5NodeBase {
     required this.config,
     required this.logger,
     required this.crypto,
+    required this.persistFilePath,
   });
 
   Future<void> init({
@@ -43,6 +48,8 @@ class S5NodeBase {
     objectsBox = blobDB;
 
     p2p = p2pService ?? P2PService(this);
+
+    await loadConfig();
 
     p2p.nodeKeyPair = await crypto.newKeyPairEd25519(
       seed: base64UrlNoPaddingDecode(
@@ -62,6 +69,41 @@ class S5NodeBase {
 
   Future<void> start() async {
     await p2p.start();
+  }
+
+  Future<void> saveConfig() async {
+    final file = File(persistFilePath);
+    final prettyJson = const JsonEncoder.withIndent('  ').convert(config);
+    await file.writeAsString(prettyJson);
+    logger.info('Config saved to $persistFilePath');
+  }
+
+  Future<void> loadConfig() async {
+    final file = File(persistFilePath);
+    if (await file.exists()) {
+      final contents = await file.readAsString();
+      config.addAll(jsonDecode(contents) as Map<String, dynamic>);
+      logger.info('Config loaded from $persistFilePath');
+    } else {
+      logger.warn('No config file found at $persistFilePath, using defaults');
+      config['blockedPeers'] ??= [];
+      await saveConfig();
+    }
+  }
+
+  List<String> get blockedPeers =>
+      (config['blockedPeers'] as List?)?.cast<String>() ?? [];
+
+  Future<void> addBlockedPeer(String peerId) async {
+    final blocked = blockedPeers.toSet()..add(peerId);
+    config['blockedPeers'] = blocked.toList();
+    await saveConfig();
+  }
+
+  Future<void> removeBlockedPeer(String peerId) async {
+    final blocked = blockedPeers.toSet()..remove(peerId);
+    config['blockedPeers'] = blocked.toList();
+    await saveConfig();
   }
 
   Map<int, Map<NodeID, Map<int, dynamic>>> readStorageLocationsFromDB(

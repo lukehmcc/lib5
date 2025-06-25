@@ -16,6 +16,10 @@ abstract class Peer {
   final List<Uri> connectionUris;
   bool isConnected = false;
   late final Uint8List challenge;
+  int messagesReceived = 0; // Tracks how many messages recevied in 1s window
+  int rateLimitOffenses =
+      0; // Every time too many messages received, this gets incremented
+  StreamSubscription? subscription;
 
   Peer({required this.connectionUris});
 
@@ -29,6 +33,13 @@ abstract class Peer {
   });
 
   String renderLocationUri();
+
+  Future<void> disconnect() async {
+    if (subscription != null) {
+      await subscription!.cancel();
+      subscription = null;
+    }
+  }
 }
 
 class WebSocketChannelPeer extends Peer {
@@ -53,8 +64,7 @@ class WebSocketChannelPeer extends Peer {
     Function? onError,
     required Logger logger,
   }) {
-    // TODO Store subscription
-    _socket.stream.listen(
+    subscription = _socket.stream.listen(
       (event) async {
         await callback(event);
       },
@@ -68,6 +78,12 @@ class WebSocketChannelPeer extends Peer {
   String renderLocationUri() {
     return locationUri;
   }
+
+  @override
+  Future<void> disconnect() async {
+    await super.disconnect();
+    _socket.sink.close();
+  }
 }
 
 class P2PService {
@@ -77,8 +93,11 @@ class P2PService {
 
   String? networkId;
 
-  P2PService(this.node) {
+  final int maxMessagesPerSecond;
+
+  P2PService(this.node, {this.maxMessagesPerSecond = 100}) {
     networkId = node.config['p2p']?['network'];
+    logger.info('P2P rate limiting enabled: $maxMessagesPerSecond msg/sec');
   }
 
   Logger get logger => node.logger;
@@ -117,7 +136,7 @@ class P2PService {
     logger.info('connection uris: $selfConnectionUris'); */
 
     final initialPeers = node.config['p2p']?['peers']?['initial'] ?? [];
-    blockedPeers = node.config['p2p']?['peers']?['block']?.cast<String>() ?? [];
+    blockedPeers = node.blockedPeers;
 
     for (final p in initialPeers) {
       connectToNode([Uri.parse(p)]);
@@ -138,8 +157,36 @@ class P2PService {
 
     final supportedFeatures = 3; // 0b00000011
 
+    Timer bounceTimer = Timer.periodic(
+      Duration(seconds: 1),
+      (Timer t) {
+        if (peer.messagesReceived > maxMessagesPerSecond) {
+          peer.rateLimitOffenses++;
+        }
+        peer.messagesReceived = 0;
+      },
+    );
+
     peer.listenForMessages(
       (Uint8List event) async {
+        peer.messagesReceived++;
+        logger.info("⚠️Node: ${peer.id} sent: ${peer.messagesReceived}");
+        // rate limit and bounce messages if they are too frequent
+        if (peer.messagesReceived > maxMessagesPerSecond) {
+          return;
+        }
+        // If the note repeats these offenses, discoonect and block
+        if (peer.rateLimitOffenses > 3) {
+          // disconnect
+          logger
+              .info('Disconnecting peer ${peer.id} for exceeding rate limit.');
+          bounceTimer.cancel(); // Stop the periodic timer
+          await peer.disconnect(); // Disconnect the peer
+
+          // block
+          blockedPeers.add(peer.id.toBase58());
+          node.addBlockedPeer(peer.id.toBase58());
+        }
         Unpacker u = Unpacker(event);
         final method = u.unpackInt();
         if (method == protocolMethodHandshakeOpen) {
@@ -290,7 +337,7 @@ class P2PService {
               final peerIdBinary = u.unpackBinary();
               final id = NodeID(peerIdBinary);
 
-              final isConnected = u.unpackBool()!;
+              final _ = u.unpackBool()!;
 
               final connectionUrisCount = u.unpackInt()!;
 
@@ -438,7 +485,6 @@ class P2PService {
       logger: logger,
     );
     peer.sendMessage(initialAuthPayloadPacker.takeBytes());
-
     return completer.future;
   }
 
@@ -673,7 +719,7 @@ class P2PService {
         /*  } */
 
         final delay = reconnectDelay[id]!;
-        reconnectDelay[id] = delay * 2;
+        reconnectDelay[id] = delay * 10; // bigger delay to reduce power
         await Future.delayed(Duration(seconds: delay));
 
         connectToNode(connectionUris);
