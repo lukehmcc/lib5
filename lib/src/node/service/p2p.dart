@@ -170,7 +170,6 @@ class P2PService {
     peer.listenForMessages(
       (Uint8List event) async {
         peer.messagesReceived++;
-        logger.info("⚠️Node: ${peer.id} sent: ${peer.messagesReceived}");
         // rate limit and bounce messages if they are too frequent
         if (peer.messagesReceived > maxMessagesPerSecond) {
           return;
